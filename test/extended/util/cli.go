@@ -7,6 +7,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/openshift/origin/pkg/client"
@@ -22,6 +24,8 @@ import (
 	"k8s.io/kubernetes/test/e2e"
 )
 
+var returnCodeRegex = regexp.MustCompile("@@@([0-9]+)@@@")
+
 // CLI provides function to call the OpenShift CLI and Kubernetes and OpenShift
 // REST clients.
 type CLI struct {
@@ -35,8 +39,20 @@ type CLI struct {
 	finalArgs       []string
 	stdout          io.Writer
 	verbose         bool
+	execBashArgs    bool
 	cmd             *cobra.Command
 	kubeFramework   *e2e.Framework
+}
+
+// ExitError happens when a command running inside of a container launched
+// using oc exec exits with non-zero code.
+// TODO: Remove this when https://github.com/kubernetes/kubernetes/pull/13728 is merged in OS
+type ExitError struct {
+	ExitStatus int
+}
+
+func (e ExitError) Error() string {
+	return fmt.Sprintf("Program exited with status %d", e.ExitStatus)
 }
 
 // NewCLI initialize the upstream E2E framework and set the namespace to match
@@ -64,6 +80,13 @@ func (c *CLI) KubeFramework() *e2e.Framework {
 // for the current session, it returns 'admin'.
 func (c *CLI) Username() string {
 	return c.username
+}
+
+// AsAdmin changes current config file path to the admin config.
+func (c *CLI) AsAdmin() *CLI {
+	nc := *c
+	nc.configPath = c.adminConfigPath
+	return &nc
 }
 
 // ChangeUser changes the user used by the current CLI session.
@@ -164,6 +187,15 @@ func (c *CLI) KubeREST() *kclient.Client {
 	return kubeClient
 }
 
+// AdminKubeREST provides a Kubernetes REST client for the admin user.
+func (c *CLI) AdminKubeREST() *kclient.Client {
+	kubeClient, _, err := configapi.GetKubeClient(c.adminConfigPath)
+	if err != nil {
+		FatalErr(err)
+	}
+	return kubeClient
+}
+
 // Namespace returns the name of the namespace used in the current test case.
 // If the namespace is not set, an empty string is returned.
 func (c *CLI) Namespace() string {
@@ -226,6 +258,17 @@ func (c *CLI) Args(args ...string) *CLI {
 	return c
 }
 
+// ExecWithoutExit executes a command in container ignoring non-zero exit value.
+// TODO: Remove this when https://github.com/kubernetes/kubernetes/pull/13728 is merged in OS
+func (c *CLI) ExecWithoutExit(pod, container, cmd string) *CLI {
+	c = c.Run("exec")
+	// TODO: if exec'd command returns non-zero exit code, it will exit, this
+	//  	 is a hack around it, we should fix it upstream.
+	c.Args(pod, "-c", container, "--", "bash", "-c", cmd+" || echo -n @@@$?@@@")
+	c.execBashArgs = true
+	return c
+}
+
 func (c *CLI) printCmd() string {
 	return strings.Join(c.finalArgs, " ")
 }
@@ -242,7 +285,18 @@ func (c *CLI) Output() (string, error) {
 	if c.verbose {
 		fmt.Printf("DEBUG: %q\n", trimmedOutput(c.stdout))
 	}
-	return trimmedOutput(c.stdout), err
+	out := trimmedOutput(c.stdout)
+	if c.execBashArgs {
+		if matched := returnCodeRegex.FindStringSubmatch(out); len(matched) > 1 {
+			out = returnCodeRegex.ReplaceAllLiteralString(out, "")
+			i, err := strconv.Atoi(matched[1])
+			if err != nil {
+				panic(err)
+			}
+			return out, &ExitError{i}
+		}
+	}
+	return out, err
 }
 
 // OutputToFile executes the command and store output to a file

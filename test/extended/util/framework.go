@@ -9,6 +9,7 @@ import (
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/resource"
 	kclient "k8s.io/kubernetes/pkg/client"
 	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/labels"
@@ -26,6 +27,8 @@ import (
 )
 
 var TestContext e2e.TestContextType
+
+const pvPrefix = "pv-"
 
 // WriteObjectToFile writes the JSON representation of runtime.Object into a temporary
 // file.
@@ -223,6 +226,38 @@ var CheckDeploymentFailedFunc = func(d *kapi.ReplicationController) bool {
 	return d.Annotations[deployapi.DeploymentStatusAnnotation] == string(deployapi.DeploymentStatusFailed)
 }
 
+// GetRunningPodNames looks up pods that are in a Running state and returns their names.
+func GetRunningPodNames(c kclient.PodInterface, label labels.Selector) (podNames []string, err error) {
+	podList, err := c.List(label, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, pod := range podList.Items {
+		if pod.Status.Phase == kapi.PodRunning {
+			podNames = append(podNames, pod.Name)
+		}
+	}
+	return podNames, nil
+}
+
+// WaitForPods waits until given number of pods that match the label selector are
+// found in Running state.
+func WaitForPods(c kclient.PodInterface, label labels.Selector, count int, timeout time.Duration) ([]string, error) {
+	var podNames []string
+	err := wait.Poll(1*time.Second, timeout, func() (bool, error) {
+		p, e := GetRunningPodNames(c, label)
+		if e != nil {
+			return true, e
+		}
+		if len(p) < count {
+			return false, nil
+		}
+		podNames = p
+		return true, nil
+	})
+	return podNames, err
+}
+
 // GetDockerImageReference retrieves the full Docker pull spec from the given ImageStream
 // and tag
 func GetDockerImageReference(c client.ImageStreamInterface, name, tag string) (string, error) {
@@ -265,6 +300,79 @@ func CreatePodForImage(dockerImageReference string) *kapi.Pod {
 	}
 }
 
+// CreatePersistentVolume creates a HostPath Persistent Volume.
+func CreatePersistentVolume(name, capacity, hostPath string) *kapi.PersistentVolume {
+	return &kapi.PersistentVolume{
+		TypeMeta: kapi.TypeMeta{
+			Kind:       "PersistentVolume",
+			APIVersion: "v1",
+		},
+		ObjectMeta: kapi.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{"name": name},
+		},
+		Spec: kapi.PersistentVolumeSpec{
+			PersistentVolumeSource: kapi.PersistentVolumeSource{
+				HostPath: &kapi.HostPathVolumeSource{
+					Path: hostPath,
+				},
+			},
+			Capacity: kapi.ResourceList{
+				kapi.ResourceStorage: resource.MustParse(capacity),
+			},
+			AccessModes: []kapi.PersistentVolumeAccessMode{
+				kapi.ReadWriteOnce,
+				// TODO: Uncomment after https://github.com/kubernetes/kubernetes/pull/10833 is merged
+				//kapi.ReadOnlyMany,
+				//kapi.ReadWriteMany,
+			},
+		},
+	}
+}
+
+// SetupHostPathVolumes will create multiple PersistentVolumes with given capacity
+func SetupHostPathVolumes(c kclient.PersistentVolumeInterface, prefix, capacity string, count int) (volumes []*kapi.PersistentVolume, err error) {
+	if count < 1 {
+		return volumes, fmt.Errorf("Invalid number of volumes: '%v'", count)
+	}
+
+	rootDir, err := ioutil.TempDir(TestContext.OutputDir, "persistent-volumes")
+	if err != nil {
+		return volumes, err
+	}
+	for i := 0; i < count; i++ {
+		dir, err := ioutil.TempDir(rootDir, fmt.Sprintf("%0.4d", i))
+		if err != nil {
+			return volumes, err
+		}
+		if err = os.Chmod(dir, 0777); err != nil {
+			return volumes, err
+		}
+		pv, err := c.Create(CreatePersistentVolume(fmt.Sprintf("%s%s-%0.4d", pvPrefix, prefix, i), capacity, dir))
+		if err != nil {
+			return volumes, err
+		}
+		volumes = append(volumes, pv)
+	}
+	return volumes, err
+}
+
+// CleanupHostPathVolumes removes all PersistentVolumes created by
+// SetupHostPathVolumes, with a given prefix
+func CleanupHostPathVolumes(c kclient.PersistentVolumeInterface, prefix string) error {
+	pvs, err := c.List(labels.Everything(), nil)
+	if err != nil {
+		return err
+	}
+	prefix = fmt.Sprintf("%s%s-", pvPrefix, prefix)
+	for _, pv := range pvs.Items {
+		if strings.HasPrefix(pv.Name, prefix) {
+			c.Delete(pv.Name)
+		}
+	}
+	return nil
+}
+
 // KubeConfigPath returns the value of KUBECONFIG environment variable
 func KubeConfigPath() string {
 	return os.Getenv("KUBECONFIG")
@@ -279,4 +387,15 @@ func ExtendedTestPath() string {
 // The path is relative to EXTENDED_TEST_PATH (./test/extended/*)
 func FixturePath(elem ...string) string {
 	return filepath.Join(append([]string{ExtendedTestPath()}, elem...)...)
+}
+
+// ParseLabelsOrDie turns the given string into a label selector or
+// panics; for tests or other cases where you know the string is valid.
+// TODO: Move this to the upstream labels package.
+func ParseLabelsOrDie(str string) labels.Selector {
+	ret, err := labels.Parse(str)
+	if err != nil {
+		panic(fmt.Sprintf("cannot parse '%v': %v", str, err))
+	}
+	return ret
 }
