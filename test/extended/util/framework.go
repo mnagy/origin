@@ -71,7 +71,7 @@ func WaitForABuild(c client.BuildInterface, name string, isOK, isFailed func(*bu
 		return err
 	}
 	// wait longer for the build to run to completion
-	return wait.Poll(5*time.Second, 20*time.Minute, func() (bool, error) {
+	return wait.Poll(5*time.Second, 30*time.Minute, func() (bool, error) {
 		list, err := c.List(labels.Everything(), fields.Set{"name": name}.AsSelector())
 		if err != nil {
 			return false, err
